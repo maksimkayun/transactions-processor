@@ -1,0 +1,3 @@
+### GET request to example server
+POST http://localhost:8080/customer/80990000-525f-0250-0125-08dc77ffabf0/openaccount/1000
+###
