@@ -3,158 +3,134 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/google/uuid"
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 	_ "github.com/lib/pq"
 	"log"
-	"net/http"
-	"strconv"
 	"time"
-
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
-	_ "github.com/google/uuid"
 )
 
-type Customer struct {
-	ID        string `gorm:"column:id;primaryKey"`
-	Name      string
-	IsDeleted bool
-}
-
-type Account struct {
-	ID            string `gorm:"column:id;primaryKey"`
-	AccountNumber int64
-	OwnerId       string
-	Amount        float64
-	OpenDate      *time.Time
-	IsDeleted     bool
+type TransactionCreatedMessage struct {
+	Id               string `json:"Id"`
+	SenderAccount    string `json:"SenderAccount"`
+	RecipientAccount string `json:"RecipientAccount"`
+	Amount           string `json:"Amount"`
+	Timestamp        string `json:"timestamp"`
 }
 
 type Transaction struct {
-	ID                            string `gorm:"column:id;primaryKey"`
-	SenderAccountId               string
-	SenderAccountAccountNumber    int64
-	RecipientAccountId            string
-	RecipientAccountAccountNumber int64
-	Amount                        float64
-	TransactionStatusId           int
-	CreatedDate                   time.Time
+	ID                  string    `db:"id"`
+	SenderAccount       int64     `db:"SenderAccountAccountNumber"`
+	RecipientAccount    int64     `db:"RecipientAccountAccountNumber"`
+	Amount              float64   `db:"Amount"`
+	TransactionStatusId int8      `db:"TransactionStatusId"`
+	CreatedDate         time.Time `db:"CreatedDate"`
 }
 
-type TransactionStatus struct {
-	ID          int `gorm:"column:id;primaryKey"`
-	Name        string
-	Description string
+type Account struct {
+	ID            string    `db:"id"`
+	AccountNumber int64     `db:"AccountNumber"`
+	OwnerId       string    `db:"OwnerId"`
+	Amount        float64   `db:"Amount"`
+	IsDeleted     bool      `db:"IsDeleted"`
+	OpenDate      time.Time `db:"OpenDate"`
 }
 
 func main() {
+	//CGO_ENABLED 1
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": "localhost:9092",
+		"group.id":          "consumer-group-3",
+		"auto.offset.reset": "earliest",
+	})
 
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-
-	r.Post("/customer/{customerid}/openaccount/{startamount}", openAccount)
-
-	fmt.Println("Server started on :8080")
-	http.ListenAndServe(":8080", r)
-}
-
-func openAccount(w http.ResponseWriter, r *http.Request) {
-	// Извлекаем параметры из URL
-	customerID := chi.URLParam(r, "customerid")
-	startAmountStr := chi.URLParam(r, "startamount")
-
-	// Преобразуем startAmount из строки в float64
-	startAmount, err := strconv.ParseFloat(startAmountStr, 64)
 	if err != nil {
-		http.Error(w, "Invalid start amount", http.StatusBadRequest)
-		return
+		panic(err)
 	}
 
-	// Открываем соединение с базой данных
+	c.SubscribeTopics([]string{"TransactionsCreated"}, nil)
+
 	db, err := sql.Open("postgres", "host=localhost user=postgres password=postgres dbname=transactions sslmode=disable")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
 
-	// Вызываем функцию OpenAccount
-	account, err := OpenAccount(db, customerID, startAmount)
-	if err != nil {
-		http.Error(w, "Error opening account", http.StatusInternalServerError)
-		return
+	for {
+		msg, err := c.ReadMessage(-1)
+		if err == nil {
+			var tr TransactionCreatedMessage
+			json.Unmarshal(msg.Value, &tr)
+			err = MakeTransaction(db, tr)
+			if err != nil {
+				fmt.Printf("Consumer error: %v (%v)\n", err)
+			}
+		} else {
+			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
+			break
+		}
 	}
 
-	// Преобразуем account в JSON и отправляем ответ
-	accountJSON, err := json.Marshal(account)
-	if err != nil {
-		http.Error(w, "Error encoding account to JSON", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(accountJSON)
+	c.Close()
 }
 
-func OpenAccount(db *sql.DB, customerID string, startAmount float64) (*Account, error) {
-	// Проверяем, существует ли клиент
-	var customer Customer
-	err := db.QueryRow(`SELECT "id", "Name", "IsDeleted" FROM "Customers" WHERE "id" = $1`, customerID).Scan(&customer.ID, &customer.Name, &customer.IsDeleted)
+func MakeTransaction(db *sql.DB, tr TransactionCreatedMessage) error {
+	// Fetch transaction from DB
+	var trDb Transaction
+	err := db.QueryRow(`SELECT t.id, t."SenderAccountAccountNumber", t."RecipientAccountAccountNumber", t."Amount", t."TransactionStatusId", t."CreatedDate" FROM "Transactions" AS t WHERE id = $1`, tr.Id).Scan(&trDb.ID, &trDb.SenderAccount, &trDb.RecipientAccount, &trDb.Amount, &trDb.TransactionStatusId, &trDb.CreatedDate)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			// Клиент не найден
-			return nil, fmt.Errorf("customer with ID %s does not exist", customerID)
-		}
-		// Другая ошибка при выполнении запроса
-		return nil, err
+		return err
 	}
 
-	// Проверяем, есть ли у пользователя закрытый счет
-	var closedAccount Account
-	err = db.QueryRow(`SELECT * FROM "Accounts" WHERE "OwnerId" = $1 AND "IsDeleted" = $2`, customerID, true).Scan(&closedAccount)
-	if err != nil && err != sql.ErrNoRows {
-		// Ошибка при выполнении запроса
-		return nil, err
+	// Update transaction status to Processing in DB
+	_, err = db.Exec(`UPDATE "Transactions" SET "TransactionStatusId" = 2 WHERE id = $1`, trDb.ID)
+	if err != nil {
+		return err
 	}
 
-	now := time.Now()
-	var account *Account
-	if err == nil {
-		// Если есть закрытый счет, переоткрываем его
-		account = &closedAccount
-		account.IsDeleted = false
-		account.Amount = startAmount
-		account.OpenDate = &now
-
-		_, err = db.Exec(`UPDATE "Accounts" SET "IsDeleted" = $1, "Amount" = $2, "OpenDate" = $3 WHERE "id" = $4`, account.IsDeleted, account.Amount, account.OpenDate, account.ID)
-		if err != nil {
-			// Ошибка при обновлении счета
-			return nil, err
-		}
-	} else {
-		// Если нет закрытого счета, создаем новый
-		var lastNumber int64
-		err = db.QueryRow(`SELECT MAX("AccountNumber") FROM "Accounts"`).Scan(&lastNumber)
-		if err != nil && err != sql.ErrNoRows {
-			lastNumber = 7770000
-		}
-
-		account = &Account{
-			ID:            uuid.New().String(),
-			AccountNumber: lastNumber + 1,
-			OwnerId:       customerID,
-			Amount:        startAmount,
-			OpenDate:      &now,
-			IsDeleted:     false,
-		}
-
-		_, err = db.Exec(`INSERT INTO "Accounts" (id, "AccountNumber", "OwnerId", "Amount", "OpenDate", "IsDeleted") VALUES ($1, $2, $3, $4, $5, $6)`, account.ID, account.AccountNumber, customer.ID, account.Amount, account.OpenDate, account.IsDeleted)
-		if err != nil {
-			// Ошибка при создании счета
-			return nil, err
-		}
+	// Fetch sender and recipient accounts from DB
+	var senderAccount, recipientAccount Account
+	err = db.QueryRow(`SELECT a.id, a."AccountNumber", a."OwnerId", a."Amount", a."IsDeleted", a."OpenDate" FROM "Accounts" AS a WHERE a."AccountNumber" = $1 AND a."IsDeleted" = false`, trDb.SenderAccount).Scan(&senderAccount.ID, &senderAccount.AccountNumber, &senderAccount.OwnerId, &senderAccount.Amount, &senderAccount.IsDeleted, &senderAccount.OpenDate)
+	if err != nil {
+		return err
+	}
+	err = db.QueryRow(`SELECT a.id, a."AccountNumber", a."OwnerId", a."Amount", a."IsDeleted", a."OpenDate" FROM "Accounts" AS a WHERE a."AccountNumber" = $1 AND a."IsDeleted" = false`, trDb.RecipientAccount).Scan(&recipientAccount.ID, &recipientAccount.AccountNumber, &recipientAccount.OwnerId, &recipientAccount.Amount, &recipientAccount.IsDeleted, &recipientAccount.OpenDate)
+	if err != nil {
+		return err
 	}
 
-	return account, nil
+	// Perform transaction
+	senderRemains, recipientRemains, err := PerformTransaction(senderAccount, recipientAccount, trDb.Amount)
+	if err != nil {
+		// Update transaction status to Cancelled in DB
+		_, err = db.Exec(`UPDATE "Transactions" SET "TransactionStatusId" = 4 WHERE id = $1`, trDb.ID)
+		return err
+	}
+
+	// Update transaction status to Completed in DB
+	_, err = db.Exec(`UPDATE "Transactions" SET "TransactionStatusId" = 3 WHERE id = $1`, trDb.ID)
+	if err != nil {
+		return err
+	}
+
+	// Update sender and recipient account amounts in DB
+	_, err = db.Exec(`UPDATE "Accounts" SET "Amount" = $1 WHERE "AccountNumber" = $2`, senderRemains, trDb.SenderAccount)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE "Accounts" SET "Amount" = $1 WHERE "AccountNumber" = $2`, recipientRemains, trDb.RecipientAccount)
+	return err
+}
+
+func PerformTransaction(senderAccount Account, recipientAccount Account, amount float64) (senderRemains float64, recipientRemains float64, err error) {
+	// Decrease sender's account
+	senderRemains = senderAccount.Amount - amount
+	if senderRemains < 0 {
+		return 0, 0, errors.New("insufficient funds")
+	}
+
+	// Increase recipient's account
+	recipientRemains = recipientAccount.Amount + amount
+
+	return senderRemains, recipientRemains, nil
 }
