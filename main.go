@@ -8,6 +8,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	_ "github.com/lib/pq"
 	"log"
+	"strconv"
 	"time"
 )
 
@@ -37,6 +38,11 @@ type Account struct {
 	OpenDate      time.Time `db:"OpenDate"`
 }
 
+type TransactionMessage struct {
+	Id        string `json:"Id"`
+	Timestamp string `json:"timestamp"`
+}
+
 func main() {
 	//CGO_ENABLED 1
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
@@ -50,11 +56,13 @@ func main() {
 	}
 
 	c.SubscribeTopics([]string{"TransactionsCreated"}, nil)
+	defer c.Close()
 
 	db, err := sql.Open("postgres", "host=localhost user=postgres password=postgres dbname=transactions sslmode=disable")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer db.Close()
 
 	for {
 		msg, err := c.ReadMessage(-1)
@@ -70,11 +78,14 @@ func main() {
 			break
 		}
 	}
-
-	c.Close()
 }
 
 func MakeTransaction(db *sql.DB, tr TransactionCreatedMessage) error {
+	p, perr := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "localhost:9092"})
+	if perr != nil {
+		return perr
+	}
+
 	// Fetch transaction from DB
 	var trDb Transaction
 	err := db.QueryRow(`SELECT t.id, t."SenderAccountAccountNumber", t."RecipientAccountAccountNumber", t."Amount", t."TransactionStatusId", t."CreatedDate" FROM "Transactions" AS t WHERE id = $1`, tr.Id).Scan(&trDb.ID, &trDb.SenderAccount, &trDb.RecipientAccount, &trDb.Amount, &trDb.TransactionStatusId, &trDb.CreatedDate)
@@ -104,6 +115,18 @@ func MakeTransaction(db *sql.DB, tr TransactionCreatedMessage) error {
 	if err != nil {
 		// Update transaction status to Cancelled in DB
 		_, err = db.Exec(`UPDATE "Transactions" SET "TransactionStatusId" = 4 WHERE id = $1`, trDb.ID)
+
+		// Define topic
+		topicCancelled := "TransactionsCancelled"
+
+		message := TransactionMessage{Id: trDb.ID, Timestamp: strconv.FormatInt(time.Now().Unix(), 10)}
+		messageJson, _ := json.Marshal(message)
+		p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicCancelled, Partition: kafka.PartitionAny},
+			Value:          messageJson,
+		}, nil)
+		p.Flush(15 * 1000)
+		p.Close()
 		return err
 	}
 
@@ -112,6 +135,20 @@ func MakeTransaction(db *sql.DB, tr TransactionCreatedMessage) error {
 	if err != nil {
 		return err
 	}
+
+	// Define topic
+	topicCompleted := "TransactionsCompleted"
+
+	message := TransactionMessage{Id: trDb.ID, Timestamp: strconv.FormatInt(time.Now().Unix(), 10)}
+	messageJson, _ := json.Marshal(message)
+	// Produce message to Kafka
+	p.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topicCompleted, Partition: kafka.PartitionAny},
+		Value:          messageJson,
+	}, nil)
+
+	p.Flush(15 * 1000)
+	p.Close()
 
 	// Update sender and recipient account amounts in DB
 	_, err = db.Exec(`UPDATE "Accounts" SET "Amount" = $1 WHERE "AccountNumber" = $2`, senderRemains, trDb.SenderAccount)
