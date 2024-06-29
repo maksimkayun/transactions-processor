@@ -1,3 +1,11 @@
-### GET request to example server
+### Open account for customer with ID 80990000-525f-0250-0125-08dc77ffabf0 and start amount 1000
 POST http://localhost:8080/customer/80990000-525f-0250-0125-08dc77ffabf0/openaccount/1000
+###
+
+### Close account for customer with ID 80990000-525f-0250-0125-08dc77ffabf0
+POST http://localhost:8080/customer/80990000-525f-0250-0125-08dc77ffabf0/closeaccount
+###
+
+### Reopen account for customer with ID 80990000-525f-0250-0125-08dc77ffabf0 with start amount 2000
+POST http://localhost:8080/customer/80990000-525f-0250-0125-08dc77ffabf0/reopenaccount/2000
 ###
